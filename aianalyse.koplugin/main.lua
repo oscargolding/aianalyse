@@ -50,6 +50,15 @@ function AIAnalyse:init()
                 end,
             }
         end)
+
+        self.ui.highlight:addToHighlightDialog("91_aianalyse_plugin_with_book", function(highlight_module)
+            return {
+                text = _("✨ AI Analyse with Book ✨"),
+                callback = function()
+                    self:onAIAnalyseWithBook(highlight_module)
+                end,
+            }
+        end)
     end
 end
 
@@ -70,17 +79,73 @@ function AIAnalyse:onAIAnalysePluginHighlight(highlight_module)
     end
 
     highlight_module:onClose()
-    self:retrieveAndShowAISummary(selected_text, book_name, book_authors)
+    self:retrieveAndShowAISummary(selected_text, book_name, book_authors, false)
 end
 
-function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_authors)
-    local loading_popup = InfoMessage:new({
-        text = _("Asking " .. self.settings.api_provider .. "..."),
-        timeout = 0,
-    })
+function AIAnalyse:onAIAnalyseWithBook(highlight_module)
+    local selected_text = highlight_module.selected_text.text
+    local book_name = self.ui.doc_props.display_title
+    local book_authors = self.ui.doc_props.authors or _("Unknown")
+
+    if not self.settings.api_key or self.settings.api_key == "" then
+        UIManager:show(InfoMessage:new({
+            text = _("Please set your API key in the AI Analysis settings."),
+        }))
+        return
+    end
+
+    highlight_module:onClose()
+    self:retrieveAndShowAISummary(selected_text, book_name, book_authors, true)
+end
+
+function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_book_context)
+    if code ~= 200 then
+        UIManager:show(InfoMessage:new({
+            text = "HTTP Error: " .. tostring(code) .. "\n" .. tostring(response_text),
+        }))
+        return
+    end
+
+    local response_json = JSON.decode(response_text)
+    if response_json and response_json.content and response_json.content[1] and response_json.content[1].text then
+        local text_content = response_json.content[1].text
+        UIManager:show(TextViewerHighlight:new({
+            title = _(self.settings.api_provider .. " Explanation"),
+            text = text_content,
+            width = Device.screen:getWidth() * 0.9,
+            height = Device.screen:getHeight() * 0.9,
+            show_parent = self,
+            highlight_text_selection = true,
+            text_selection_callback = function(selection)
+                self:retrieveAndShowAISummary(selection, book_name, book_authors, with_book_context)
+            end,
+        }))
+        logger.info("Cached tokens used: ", response_json.usage.cache_read_input_tokens)
+    else
+        UIManager:show(InfoMessage:new({
+            text = "Failed to parse response: " .. tostring(response_text),
+        }))
+    end
+end
+
+function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_authors, with_book_context)
+    local loading_text = with_book_context and _("Analysing with book context... (this may take a while)")
+        or _("Asking " .. self.settings.api_provider .. "...")
+    local loading_popup = InfoMessage:new({ text = loading_text, timeout = 0 })
     UIManager:show(loading_popup)
     UIManager:forceRePaint()
 
+    local model = self.settings.api_provider == "Anthropic" and "claude-sonnet-4-5" or "deepseek-chat"
+    local url = self.settings.api_provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
+        or "https://api.deepseek.com/anthropic/v1/messages"
+
+    local headers = {
+        ["content-type"] = "application/json",
+        ["x-api-key"] = self.settings.api_key,
+        ["anthropic-version"] = "2023-06-01",
+        -- prompt caching is supported by both deepseek and ahthropic, save tokens on future calls
+        ["anthropic-beta"] = "prompt-caching-2024-07-31",
+    }
     local template = [[
 I am currently reading "%1" by %2.
 I have highlighted the following text:
@@ -89,34 +154,44 @@ I have highlighted the following text:
 Please explain the meaning and context of this specific highlighted text within the book in 200 words or less.]]
     local prompt = T(template, book_name, book_authors, selected_text)
 
-    local model = "deepseek-chat"
-    local url = "https://api.deepseek.com/anthropic/v1/messages"
-    if self.settings.api_provider == "Anthropic" then
-        model = "claude-sonnet-4-5"
-        url = "https://api.anthropic.com/v1/messages"
+    local payload
+    if with_book_context then
+        local book_content = self:getFullBookText()
+        if not book_content then
+            UIManager:close(loading_popup)
+            UIManager:show(InfoMessage:new({ text = _("Could not get book content.") }))
+            return
+        end
+
+        local prompt_text = template .. "You should use the text associated from the book provided as context."
+        payload = {
+            model = model,
+            max_tokens = 1024,
+            messages = {
+                {
+                    role = "user",
+                    content = {
+                        { type = "text", text = book_content, cache_control = { type = "ephemeral" } },
+                        { type = "text", text = prompt_text },
+                    },
+                },
+            },
+        }
+    else -- not with_book_context
+        payload = {
+            model = model,
+            max_tokens = 1024,
+            system = "You are a literary expert. The user will provide context about a book they are reading. Explain the specific text they highlighted. Do not treat the highlighted text as the title of the work.",
+            messages = {
+                { role = "user", content = prompt },
+            },
+        }
     end
 
-    local payload = {
-        model = model,
-        max_tokens = 1000,
-        system = "You are a literary expert. The user will provide context about a book they are reading. Explain the specific text they highlighted. Do not treat the highlighted text as the title of the work.",
-        messages = {
-            {
-                role = "user",
-                content = prompt,
-            },
-        },
-    }
-
     local body_str = JSON.encode(payload)
-    local headers = {
-        ["x-api-key"] = self.settings.api_key,
-        ["anthropic-version"] = "2023-06-01",
-        ["content-type"] = "application/json",
-        ["content-length"] = #body_str,
-    }
-    local response_body = {}
+    headers["content-length"] = #body_str
 
+    local response_body = {}
     local _res, code = http.request({
         url = url,
         method = "POST",
@@ -126,39 +201,51 @@ Please explain the meaning and context of this specific highlighted text within 
     })
 
     UIManager:close(loading_popup)
-
     local response_text = table.concat(response_body)
 
-    if code ~= 200 then
-        UIManager:show(InfoMessage:new({
-            text = "HTTP Error: " .. tostring(code) .. "\n" .. tostring(response_text),
-        }))
-        return
+    self:handleAIResponse(response_text, code, book_name, book_authors, with_book_context)
+end
+
+function AIAnalyse:getFullBookText()
+    local doc = self.ui.document
+    if not doc or not doc.getHTMLFromXPointer then
+        logger.warn("AIAnalyse: Could not get document or getHTMLFromXPointer is not available.")
+        return nil
     end
 
-    local body_json = JSON.decode(response_text)
-    if body_json and body_json.content and body_json.content[1] and body_json.content[1].text then
-        UIManager:show(TextViewerHighlight:new({
-            title = _(self.settings.api_provider .. " Explanation"),
-            text = body_json.content[1].text,
-            width = Device.screen:getWidth() * 0.9,
-            height = Device.screen:getHeight() * 0.9,
-            show_parent = self,
-            highlight_text_selection = true,
-            text_selection_callback = function(selection)
-                self:retrieveAndShowAISummary(selection, book_name, book_authors)
-            end,
-        }))
-    else
-        UIManager:show(InfoMessage:new({
-            text = "Failed to parse response: " .. tostring(response_text),
-        }))
+    local html_content = doc:getHTMLFromXPointer(".0", 0x4000)
+    if not html_content then
+        logger.warn("AIAnalyse: Failed to get HTML content from document.")
+        return nil
     end
+
+    -- Step 1: Replace block-level elements with newlines to preserve structure
+    -- Replace </p> with double newlines for clear paragraph separation
+    local text = html_content:gsub("</p>", "\n\n")
+    -- Replace </div> with double newlines (adjust to single if less spacing is desired)
+    text = text:gsub("</div>", "\n\n")
+    -- Replace <br> and <br/> with a single newline
+    text = text:gsub("<br%s*/?>", "\n")
+
+    -- Step 2: Remove all remaining HTML tags (this will catch <img>, <span>, <strong>, <h1>, etc.)
+    text = text:gsub("<[^>]+>", "")
+
+    -- Step 3: Decode common HTML entities
+    text = text:gsub("&lt;", "<")
+    text = text:gsub("&gt;", ">")
+    text = text:gsub("&amp;", "&")
+    text = text:gsub("&quot;", '"')
+    text = text:gsub("&apos;", "'")
+    text = text:gsub("&nbsp;", " ")
+
+    logger.info("found text with size: ", #text) -- Log the size of the *stripped* text
+    return text
 end
 
 function AIAnalyse:stopPlugin()
     if self.ui.highlight then
         self.ui.highlight:removeFromHighlightDialog("90_aianalyse_plugin")
+        self.ui.highlight:removeFromHighlightDialog("91_aianalyse_plugin_with_book")
     end
 end
 
