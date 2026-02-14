@@ -51,11 +51,11 @@ function AIAnalyse:init()
             }
         end)
 
-        self.ui.highlight:addToHighlightDialog("91_aianalyse_plugin_with_book", function(highlight_module)
+        self.ui.highlight:addToHighlightDialog("91_aianalyse_plugin_with_xray", function(highlight_module)
             return {
-                text = _("✨ AI Analyse with Book ✨"),
+                text = _("✨ AI X-Ray ✨"),
                 callback = function()
-                    self:onAIAnalyseWithBook(highlight_module)
+                    self:onAIXRay(highlight_module)
                 end,
             }
         end)
@@ -82,7 +82,7 @@ function AIAnalyse:onAIAnalysePluginHighlight(highlight_module)
     self:retrieveAndShowAISummary(selected_text, book_name, book_authors, false)
 end
 
-function AIAnalyse:onAIAnalyseWithBook(highlight_module)
+function AIAnalyse:onAIXRay(highlight_module)
     local selected_text = highlight_module.selected_text.text
     local book_name = self.ui.doc_props.display_title
     local book_authors = self.ui.doc_props.authors or _("Unknown")
@@ -98,7 +98,7 @@ function AIAnalyse:onAIAnalyseWithBook(highlight_module)
     self:retrieveAndShowAISummary(selected_text, book_name, book_authors, true)
 end
 
-function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_book_context)
+function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_xray_context)
     if code ~= 200 then
         UIManager:show(InfoMessage:new({
             text = "HTTP Error: " .. tostring(code) .. "\n" .. tostring(response_text),
@@ -117,10 +117,10 @@ function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors
             show_parent = self,
             highlight_text_selection = true,
             text_selection_callback = function(selection)
-                self:retrieveAndShowAISummary(selection, book_name, book_authors, with_book_context)
+                self:retrieveAndShowAISummary(selection, book_name, book_authors, with_xray_context)
             end,
         }))
-        logger.info("Cached tokens used: ", response_json.usage.cache_read_input_tokens)
+        logger.dbg("AIAnalyse: Cached tokens used: ", response_json.usage.cache_read_input_tokens)
     else
         UIManager:show(InfoMessage:new({
             text = "Failed to parse response: " .. tostring(response_text),
@@ -128,8 +128,8 @@ function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors
     end
 end
 
-function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_authors, with_book_context)
-    local loading_text = with_book_context and _("Analysing with book context... (this may take a while)")
+function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_authors, with_xray_context)
+    local loading_text = with_xray_context and _("Analysing with AI X-Ray... (this may take a while)")
         or _("Asking " .. self.settings.api_provider .. "...")
     local loading_popup = InfoMessage:new({ text = loading_text, timeout = 0 })
     UIManager:show(loading_popup)
@@ -155,15 +155,15 @@ Please explain the meaning and context of this specific highlighted text within 
     local prompt = T(template, book_name, book_authors, selected_text)
 
     local payload
-    if with_book_context then
-        local book_content = self:getFullBookText()
+    if with_xray_context then
+        local book_content = self:getTextUpToCurrentPage()
         if not book_content then
             UIManager:close(loading_popup)
             UIManager:show(InfoMessage:new({ text = _("Could not get book content.") }))
             return
         end
 
-        local prompt_text = template .. "You should use the text associated from the book provided as context."
+        local prompt_text = prompt .. " You should use the text associated from the book provided as context."
         payload = {
             model = model,
             max_tokens = 1024,
@@ -177,7 +177,7 @@ Please explain the meaning and context of this specific highlighted text within 
                 },
             },
         }
-    else -- not with_book_context
+    else -- not with_xray_context
         payload = {
             model = model,
             max_tokens = 1024,
@@ -203,17 +203,55 @@ Please explain the meaning and context of this specific highlighted text within 
     UIManager:close(loading_popup)
     local response_text = table.concat(response_body)
 
-    self:handleAIResponse(response_text, code, book_name, book_authors, with_book_context)
+    self:handleAIResponse(response_text, code, book_name, book_authors, with_xray_context)
 end
 
-function AIAnalyse:getFullBookText()
+function AIAnalyse:getTextUpToCurrentPage()
     local doc = self.ui.document
     if not doc or not doc.getHTMLFromXPointer then
         logger.warn("AIAnalyse: Could not get document or getHTMLFromXPointer is not available.")
         return nil
     end
 
-    local html_content = doc:getHTMLFromXPointer(".0", 0x4000)
+    local current_page = self.ui:getCurrentPage()
+    local total_pages = doc:getPageCount()
+
+    logger.dbg(
+        string.format(
+            "AIAnalyse: current_page=%s, total_pages=%s, has_paging=%s, has_range_func=%s",
+            tostring(current_page),
+            tostring(total_pages),
+            tostring(self.ui.paging ~= nil),
+            tostring(doc.getHTMLFromXPointers ~= nil)
+        )
+    )
+
+    local html_content
+    -- We want to include the current page, so we get text up to the start of the next page.
+    if current_page and total_pages and current_page < total_pages and doc.getHTMLFromXPointers then
+        local start_xp = doc:getPageXPointer(1)
+        local next_page_xp = doc:getPageXPointer(current_page + 1)
+        if start_xp and next_page_xp then
+            logger.dbg("AIAnalyse: fetching text range from page 1 to page " .. (current_page + 1))
+            html_content = doc:getHTMLFromXPointers(start_xp, next_page_xp, 0x4000)
+        else
+            logger.dbg(
+                string.format(
+                    "AIAnalyse: failed to get XPointers: start_xp=%s, next_page_xp=%s",
+                    tostring(start_xp ~= nil),
+                    tostring(next_page_xp ~= nil)
+                )
+            )
+        end
+    end
+
+    -- Fallback to the original behavior (full document) if we're on the last page
+    -- or if getHTMLFromXPointers is unavailable.
+    if not html_content then
+        logger.dbg("AIAnalyse: using the full text as the context (fallback)")
+        html_content = doc:getHTMLFromXPointer(".0", 0x4000)
+    end
+
     if not html_content then
         logger.warn("AIAnalyse: Failed to get HTML content from document.")
         return nil
@@ -238,14 +276,24 @@ function AIAnalyse:getFullBookText()
     text = text:gsub("&apos;", "'")
     text = text:gsub("&nbsp;", " ")
 
-    logger.info("found text with size: ", #text) -- Log the size of the *stripped* text
+    logger.dbg("AIAnalyse: found text with size: ", #text) -- Log the size of the *stripped* text
+
+    -- Limit text to avoid exceeding model context limits (128k tokens)
+    -- We take the first 10k (intro/setup) and the last 95k (recent context)
+    local max_head = 10000
+    local max_tail = 95000
+    if #text > (max_head + max_tail + 500) then
+        logger.dbg("AIAnalyse: text exceeds limit, combining head and tail context")
+        text = text:sub(1, max_head) .. "\n\n[... middle of book text omitted to save context space ...]\n\n" .. text:sub(-max_tail)
+    end
+
     return text
 end
 
 function AIAnalyse:stopPlugin()
     if self.ui.highlight then
         self.ui.highlight:removeFromHighlightDialog("90_aianalyse_plugin")
-        self.ui.highlight:removeFromHighlightDialog("91_aianalyse_plugin_with_book")
+        self.ui.highlight:removeFromHighlightDialog("91_aianalyse_plugin_with_xray")
     end
 end
 
