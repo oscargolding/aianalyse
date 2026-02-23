@@ -29,10 +29,13 @@ local AIAnalyse = WidgetContainer:extend({
 function AIAnalyse:init()
     -- Load settings or initialize defaults
     self.settings = G_reader_settings:readSetting("aianalyse_plugin")
-    if not self.settings then
+    if not self.settings or not self.settings.api_keys then
         self.settings = {
             api_provider = "DeepSeek",
-            api_key = "",
+            api_keys = {
+                DeepSeek = "",
+                Anthropic = "",
+            },
         }
         self:saveSettings()
     end
@@ -71,7 +74,8 @@ function AIAnalyse:onAIAnalysePluginHighlight(highlight_module)
     local book_name = self.ui.doc_props.display_title
     local book_authors = self.ui.doc_props.authors or _("Unknown")
 
-    if not self.settings.api_key or self.settings.api_key == "" then
+    local api_key = self.settings.api_keys[self.settings.api_provider]
+    if not api_key or api_key == "" then
         UIManager:show(InfoMessage:new({
             text = _("Please set your API key in the AI Analysis settings."),
         }))
@@ -87,7 +91,8 @@ function AIAnalyse:onAIXRay(highlight_module)
     local book_name = self.ui.doc_props.display_title
     local book_authors = self.ui.doc_props.authors or _("Unknown")
 
-    if not self.settings.api_key or self.settings.api_key == "" then
+    local api_key = self.settings.api_keys[self.settings.api_provider]
+    if not api_key or api_key == "" then
         UIManager:show(InfoMessage:new({
             text = _("Please set your API key in the AI Analysis settings."),
         }))
@@ -139,9 +144,10 @@ function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_autho
     local url = self.settings.api_provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
         or "https://api.deepseek.com/anthropic/v1/messages"
 
+    local api_key = self.settings.api_keys[self.settings.api_provider]
     local headers = {
         ["content-type"] = "application/json",
-        ["x-api-key"] = self.settings.api_key,
+        ["x-api-key"] = api_key,
         ["anthropic-version"] = "2023-06-01",
         -- prompt caching is supported by both deepseek and ahthropic, save tokens on future calls
         ["anthropic-beta"] = "prompt-caching-2024-07-31",
@@ -284,7 +290,9 @@ function AIAnalyse:getTextUpToCurrentPage()
     local max_tail = 95000
     if #text > (max_head + max_tail + 500) then
         logger.dbg("AIAnalyse: text exceeds limit, combining head and tail context")
-        text = text:sub(1, max_head) .. "\n\n[... middle of book text omitted to save context space ...]\n\n" .. text:sub(-max_tail)
+        text = text:sub(1, max_head)
+            .. "\n\n[... middle of book text omitted to save context space ...]\n\n"
+            .. text:sub(-max_tail)
     end
 
     return text
@@ -299,7 +307,7 @@ end
 
 function AIAnalyse:showSettings()
     local api_key_field = {
-        text = self.settings.api_key or "",
+        text = self.settings.api_keys[self.settings.api_provider] or "",
         hint = _("Enter API Key"),
         description = _("API Key"),
     }
@@ -318,10 +326,10 @@ function AIAnalyse:showSettings()
                     end,
                 },
                 {
-                    text = _("Save"),
+                    text = _("Set AI Provider"),
                     callback = function()
                         local fields = settings_dialog:getFields()
-                        self.settings.api_key = fields[1]
+                        self.settings.api_keys[self.settings.api_provider] = fields[1]
                         self:saveSettings()
                         UIManager:close(settings_dialog)
                     end,
@@ -349,7 +357,20 @@ function AIAnalyse:showSettings()
             },
         },
         button_select_callback = function(btn_entry)
+            -- 1. Save current input to the OLD provider's slot before switching
+            local current_input = settings_dialog:getFields()[1]
+            self.settings.api_keys[self.settings.api_provider] = current_input
+
+            -- 2. Update active provider
             self.settings.api_provider = btn_entry.provider
+
+            -- 3. Load NEW provider's key into the input field widget
+            local new_key = self.settings.api_keys[self.settings.api_provider] or ""
+            if settings_dialog.input_fields and settings_dialog.input_fields[1] then
+                -- input filed is the one storing the input box
+                settings_dialog.input_fields[1]:setText(new_key)
+            end
+
             UIManager:setDirty(settings_dialog, "ui")
         end,
     })
