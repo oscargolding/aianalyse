@@ -35,6 +35,7 @@ function AIAnalyse:init()
             api_keys = {
                 DeepSeek = "",
                 Anthropic = "",
+                Gemini = "",
             },
         }
         self:saveSettings()
@@ -103,17 +104,49 @@ function AIAnalyse:onAIXRay(highlight_module)
     self:retrieveAndShowAISummary(selected_text, book_name, book_authors, true)
 end
 
+function AIAnalyse:extractResponseData(provider, response_json)
+    local text_content, cached_tokens = nil, 0
+    if not response_json then
+        return text_content, cached_tokens
+    end
+
+    if provider == "Gemini" then
+        if
+            response_json.candidates
+            and response_json.candidates[1]
+            and response_json.candidates[1].content
+            and response_json.candidates[1].content.parts
+            and response_json.candidates[1].content.parts[1]
+        then
+            text_content = response_json.candidates[1].content.parts[1].text
+            if response_json.usageMetadata and response_json.usageMetadata.cachedContentTokenCount then
+                cached_tokens = response_json.usageMetadata.cachedContentTokenCount
+            end
+        end
+    else
+        if response_json.content and response_json.content[1] and response_json.content[1].text then
+            text_content = response_json.content[1].text
+            if response_json.usage and response_json.usage.cache_read_input_tokens then
+                cached_tokens = response_json.usage.cache_read_input_tokens
+            end
+        end
+    end
+    return text_content, cached_tokens
+end
+
 function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_xray_context)
     if code ~= 200 then
         UIManager:show(InfoMessage:new({
-            text = "HTTP Error: " .. tostring(code) .. "\n" .. tostring(response_text),
+            text = "HTTP Error: " .. tostring(code),
         }))
+        logger.dbg("AIAnalyse: found error response from model: ", tostring(response_text))
         return
     end
 
     local response_json = JSON.decode(response_text)
-    if response_json and response_json.content and response_json.content[1] and response_json.content[1].text then
-        local text_content = response_json.content[1].text
+    local text_content, cached_tokens = self:extractResponseData(self.settings.api_provider, response_json)
+
+    if text_content then
         UIManager:show(TextViewerHighlight:new({
             title = _(self.settings.api_provider .. " Explanation"),
             text = text_content,
@@ -125,11 +158,87 @@ function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors
                 self:retrieveAndShowAISummary(selection, book_name, book_authors, with_xray_context)
             end,
         }))
-        logger.dbg("AIAnalyse: Cached tokens used: ", response_json.usage.cache_read_input_tokens)
+        logger.dbg("AIAnalyse: Cached tokens used: ", cached_tokens)
     else
         UIManager:show(InfoMessage:new({
             text = "Failed to parse response: " .. tostring(response_text),
         }))
+    end
+end
+
+function AIAnalyse:getProviderConfig(provider, api_key)
+    if provider == "Gemini" then
+        local model = "gemini-flash-latest"
+        return {
+            model = model,
+            url = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent",
+            headers = {
+                ["content-type"] = "application/json",
+                ["x-goog-api-key"] = api_key,
+            },
+        }
+    else
+        local model = provider == "Anthropic" and "claude-sonnet-4-5" or "deepseek-chat"
+        local url = provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
+            or "https://api.deepseek.com/anthropic/v1/messages"
+        return {
+            model = model,
+            url = url,
+            headers = {
+                ["content-type"] = "application/json",
+                ["x-api-key"] = api_key,
+                ["anthropic-version"] = "2023-06-01",
+                ["anthropic-beta"] = "prompt-caching-2024-07-31",
+            },
+        }
+    end
+end
+
+function AIAnalyse:buildProviderPayload(provider, model, prompt, system_prompt, book_content)
+    if provider == "Gemini" then
+        local parts = {}
+        if book_content then
+            table.insert(parts, { text = book_content })
+            table.insert(
+                parts,
+                { text = prompt .. " You should use the text associated from the book provided as context." }
+            )
+            return {
+                contents = { { parts = parts } },
+            }
+        else
+            table.insert(parts, { text = prompt })
+            return {
+                systemInstruction = { parts = { { text = system_prompt } } },
+                contents = { { parts = parts } },
+            }
+        end
+    else
+        if book_content then
+            local prompt_text = prompt .. " You should use the text associated from the book provided as context."
+            return {
+                model = model,
+                max_tokens = 1024,
+                messages = {
+                    {
+                        role = "user",
+                        content = {
+                            { type = "text", text = book_content, cache_control = { type = "ephemeral" } },
+                            { type = "text", text = prompt_text },
+                        },
+                    },
+                },
+            }
+        else
+            return {
+                model = model,
+                max_tokens = 1024,
+                system = system_prompt,
+                messages = {
+                    { role = "user", content = prompt },
+                },
+            }
+        end
     end
 end
 
@@ -140,18 +249,10 @@ function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_autho
     UIManager:show(loading_popup)
     UIManager:forceRePaint()
 
-    local model = self.settings.api_provider == "Anthropic" and "claude-sonnet-4-5" or "deepseek-chat"
-    local url = self.settings.api_provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
-        or "https://api.deepseek.com/anthropic/v1/messages"
+    local provider = self.settings.api_provider
+    local api_key = self.settings.api_keys[provider]
+    local config = self:getProviderConfig(provider, api_key)
 
-    local api_key = self.settings.api_keys[self.settings.api_provider]
-    local headers = {
-        ["content-type"] = "application/json",
-        ["x-api-key"] = api_key,
-        ["anthropic-version"] = "2023-06-01",
-        -- prompt caching is supported by both deepseek and ahthropic, save tokens on future calls
-        ["anthropic-beta"] = "prompt-caching-2024-07-31",
-    }
     local template = [[
 I am currently reading "%1" by %2.
 I have highlighted the following text:
@@ -159,47 +260,27 @@ I have highlighted the following text:
 
 Please explain the meaning and context of this specific highlighted text within the book in 200 words or less.]]
     local prompt = T(template, book_name, book_authors, selected_text)
+    local system_prompt =
+        "You are a literary expert. The user will provide context about a book they are reading. Explain the specific text they highlighted. Do not treat the highlighted text as the title of the work."
 
-    local payload
+    local book_content = nil
     if with_xray_context then
-        local book_content = self:getTextUpToCurrentPage()
+        book_content = self:getTextUpToCurrentPage()
         if not book_content then
             UIManager:close(loading_popup)
             UIManager:show(InfoMessage:new({ text = _("Could not get book content.") }))
             return
         end
-
-        local prompt_text = prompt .. " You should use the text associated from the book provided as context."
-        payload = {
-            model = model,
-            max_tokens = 1024,
-            messages = {
-                {
-                    role = "user",
-                    content = {
-                        { type = "text", text = book_content, cache_control = { type = "ephemeral" } },
-                        { type = "text", text = prompt_text },
-                    },
-                },
-            },
-        }
-    else -- not with_xray_context
-        payload = {
-            model = model,
-            max_tokens = 1024,
-            system = "You are a literary expert. The user will provide context about a book they are reading. Explain the specific text they highlighted. Do not treat the highlighted text as the title of the work.",
-            messages = {
-                { role = "user", content = prompt },
-            },
-        }
     end
 
+    local payload = self:buildProviderPayload(provider, config.model, prompt, system_prompt, book_content)
     local body_str = JSON.encode(payload)
+    local headers = config.headers
     headers["content-length"] = #body_str
 
     local response_body = {}
     local _res, code = http.request({
-        url = url,
+        url = config.url,
         method = "POST",
         headers = headers,
         source = ltn12.source.string(body_str),
@@ -288,12 +369,19 @@ function AIAnalyse:getTextUpToCurrentPage()
     -- We take the first 10k (intro/setup) and the last 95k (recent context)
     local max_head = 10000
     local max_tail = 95000
+
+    if self.settings.api_provider == "Gemini" then
+        -- gemini offers a much larger context window, so this can be used to get more information
+        max_tail = max_tail * 10
+    end
+
     if #text > (max_head + max_tail + 500) then
         logger.dbg("AIAnalyse: text exceeds limit, combining head and tail context")
         text = text:sub(1, max_head)
             .. "\n\n[... middle of book text omitted to save context space ...]\n\n"
             .. text:sub(-max_tail)
     end
+    logger.dbg("AIAnalyse: providing text of size to model: ", #text)
 
     return text
 end
@@ -355,6 +443,13 @@ function AIAnalyse:showSettings()
                     provider = "DeepSeek",
                 },
             },
+            {
+                {
+                    text = _("Gemini"),
+                    checked = (self.settings.api_provider == "Gemini"),
+                    provider = "Gemini",
+                },
+            },
         },
         button_select_callback = function(btn_entry)
             -- 1. Save current input to the OLD provider's slot before switching
@@ -396,7 +491,7 @@ function AIAnalyse:addToMainMenu(menu_items)
                 callback = function()
                     UIManager:show(InfoMessage:new({
                         text = _(
-                            "AI Analysis Plugin v1.0\n\nProvides AI-powered explanations for text selections using DeepSeek or Anthropic.\n\nSupports recursive lookups and selection highlighting."
+                            "AI Analysis Plugin v1.0\n\nProvides AI-powered explanations for text selections using DeepSeek, Anthropic or Gemini.\n\nSupports recursive lookups and selection highlighting."
                         ),
                     }))
                 end,
