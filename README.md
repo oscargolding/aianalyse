@@ -2,12 +2,15 @@
 
 [KOReader](https://koreader.rocks/user_guide/) plugin that allows for text analysis using LLMs. 
 
-![text analysis](https://dump-show-cap.s3.ap-southeast-2.amazonaws.com/output.gif)
+Supports XRay analysis on a book.
+
+![text analysis](https://dump-show-cap.s3.ap-southeast-2.amazonaws.com/aianalyse.gif)
 
 ## Supported LLM Providers
 
 * Anthropic 🤖
 * DeepSeek 🐋
+* Gemini 💎
 
 ## Installation
 
@@ -34,5 +37,5 @@ Tap the wrench icon and "More tools" -> "Plugin management" -> enable (check) "A
 
 When a book is open, select "More tools" -> "AI Analyse" -> "Settings".
 
-You will be given an option to enter an API key for either Anthropic or DeepSeek.
+You will be given an option to enter an API key for either Anthropic, DeepSeek or Gemini.
 

@@ -66,8 +66,122 @@ function AIAnalyse:init()
     end
 end
 
+function AIAnalyse:addToMainMenu(menu_items)
+    menu_items.hello_world = {
+        text = _("✨ AI Analyse"),
+        sorting_hint = "more_tools",
+        sub_item_table = {
+            {
+                text = _("Settings"),
+                callback = function()
+                    self:showSettings()
+                end,
+            },
+            {
+                text = _("About"),
+                callback = function()
+                    UIManager:show(InfoMessage:new({
+                        text = _(
+                            "AI Analysis Plugin v1.0\n\nProvides AI-powered explanations for text selections using DeepSeek, Anthropic or Gemini.\n\nSupports recursive lookups and selection highlighting."
+                        ),
+                    }))
+                end,
+            },
+        },
+    }
+end
+
+function AIAnalyse:showSettings()
+    local api_key_field = {
+        text = self.settings.api_keys[self.settings.api_provider] or "",
+        hint = _("Enter API Key"),
+        description = _("API Key"),
+    }
+
+    local settings_dialog
+    settings_dialog = MultiInputDialog:new({
+        title = _("AI Analyse Settings"),
+        fields = { api_key_field },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+                {
+                    text = _("Set AI Provider"),
+                    callback = function()
+                        local fields = settings_dialog:getFields()
+                        self.settings.api_keys[self.settings.api_provider] = fields[1]
+                        self:saveSettings()
+                        UIManager:close(settings_dialog)
+                    end,
+                },
+            },
+        },
+    })
+
+    local provider_table = RadioButtonTable:new({
+        width = settings_dialog:getAddedWidgetAvailableWidth(),
+        radio_buttons = {
+            {
+                {
+                    text = _("Anthropic"),
+                    checked = (self.settings.api_provider == "Anthropic"),
+                    provider = "Anthropic",
+                },
+            },
+            {
+                {
+                    text = _("DeepSeek"),
+                    checked = (self.settings.api_provider == "DeepSeek"),
+                    provider = "DeepSeek",
+                },
+            },
+            {
+                {
+                    text = _("Gemini"),
+                    checked = (self.settings.api_provider == "Gemini"),
+                    provider = "Gemini",
+                },
+            },
+        },
+        button_select_callback = function(btn_entry)
+            -- 1. Save current input to the OLD provider's slot before switching
+            local current_input = settings_dialog:getFields()[1]
+            self.settings.api_keys[self.settings.api_provider] = current_input
+
+            -- 2. Update active provider
+            self.settings.api_provider = btn_entry.provider
+
+            -- 3. Load NEW provider's key into the input field widget
+            local new_key = self.settings.api_keys[self.settings.api_provider] or ""
+            if settings_dialog.input_fields and settings_dialog.input_fields[1] then
+                -- input filed is the one storing the input box
+                settings_dialog.input_fields[1]:setText(new_key)
+            end
+
+            UIManager:setDirty(settings_dialog, "ui")
+        end,
+    })
+
+    settings_dialog:addWidget(provider_table)
+    UIManager:show(settings_dialog)
+    settings_dialog:onShowKeyboard()
+end
+
 function AIAnalyse:saveSettings()
     G_reader_settings:saveSetting("aianalyse_plugin", self.settings)
+end
+
+function AIAnalyse:stopPlugin()
+    if self.ui.highlight then
+        self.ui.highlight:removeFromHighlightDialog("90_aianalyse_plugin")
+        self.ui.highlight:removeFromHighlightDialog("91_aianalyse_plugin_with_xray")
+    end
 end
 
 function AIAnalyse:onAIAnalysePluginHighlight(highlight_module)
@@ -102,144 +216,6 @@ function AIAnalyse:onAIXRay(highlight_module)
 
     highlight_module:onClose()
     self:retrieveAndShowAISummary(selected_text, book_name, book_authors, true)
-end
-
-function AIAnalyse:extractResponseData(provider, response_json)
-    local text_content, cached_tokens = nil, 0
-    if not response_json then
-        return text_content, cached_tokens
-    end
-
-    if provider == "Gemini" then
-        if
-            response_json.candidates
-            and response_json.candidates[1]
-            and response_json.candidates[1].content
-            and response_json.candidates[1].content.parts
-            and response_json.candidates[1].content.parts[1]
-        then
-            text_content = response_json.candidates[1].content.parts[1].text
-            if response_json.usageMetadata and response_json.usageMetadata.cachedContentTokenCount then
-                cached_tokens = response_json.usageMetadata.cachedContentTokenCount
-            end
-        end
-    else
-        if response_json.content and response_json.content[1] and response_json.content[1].text then
-            text_content = response_json.content[1].text
-            if response_json.usage and response_json.usage.cache_read_input_tokens then
-                cached_tokens = response_json.usage.cache_read_input_tokens
-            end
-        end
-    end
-    return text_content, cached_tokens
-end
-
-function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_xray_context)
-    if code ~= 200 then
-        UIManager:show(InfoMessage:new({
-            text = "HTTP Error: " .. tostring(code),
-        }))
-        logger.dbg("AIAnalyse: found error response from model: ", tostring(response_text))
-        return
-    end
-
-    local response_json = JSON.decode(response_text)
-    local text_content, cached_tokens = self:extractResponseData(self.settings.api_provider, response_json)
-
-    if text_content then
-        UIManager:show(TextViewerHighlight:new({
-            title = _(self.settings.api_provider .. " Explanation"),
-            text = text_content,
-            width = Device.screen:getWidth() * 0.9,
-            height = Device.screen:getHeight() * 0.9,
-            show_parent = self,
-            highlight_text_selection = true,
-            text_selection_callback = function(selection)
-                self:retrieveAndShowAISummary(selection, book_name, book_authors, with_xray_context)
-            end,
-        }))
-        logger.dbg("AIAnalyse: Cached tokens used: ", cached_tokens)
-    else
-        UIManager:show(InfoMessage:new({
-            text = "Failed to parse response: " .. tostring(response_text),
-        }))
-    end
-end
-
-function AIAnalyse:getProviderConfig(provider, api_key)
-    if provider == "Gemini" then
-        local model = "gemini-flash-latest"
-        return {
-            model = model,
-            url = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent",
-            headers = {
-                ["content-type"] = "application/json",
-                ["x-goog-api-key"] = api_key,
-            },
-        }
-    else
-        local model = provider == "Anthropic" and "claude-sonnet-4-5" or "deepseek-chat"
-        local url = provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
-            or "https://api.deepseek.com/anthropic/v1/messages"
-        return {
-            model = model,
-            url = url,
-            headers = {
-                ["content-type"] = "application/json",
-                ["x-api-key"] = api_key,
-                ["anthropic-version"] = "2023-06-01",
-                ["anthropic-beta"] = "prompt-caching-2024-07-31",
-            },
-        }
-    end
-end
-
-function AIAnalyse:buildProviderPayload(provider, model, prompt, system_prompt, book_content)
-    if provider == "Gemini" then
-        local parts = {}
-        if book_content then
-            table.insert(parts, { text = book_content })
-            table.insert(
-                parts,
-                { text = prompt .. " You should use the text associated from the book provided as context." }
-            )
-            return {
-                contents = { { parts = parts } },
-            }
-        else
-            table.insert(parts, { text = prompt })
-            return {
-                systemInstruction = { parts = { { text = system_prompt } } },
-                contents = { { parts = parts } },
-            }
-        end
-    else
-        if book_content then
-            local prompt_text = prompt .. " You should use the text associated from the book provided as context."
-            return {
-                model = model,
-                max_tokens = 1024,
-                messages = {
-                    {
-                        role = "user",
-                        content = {
-                            { type = "text", text = book_content, cache_control = { type = "ephemeral" } },
-                            { type = "text", text = prompt_text },
-                        },
-                    },
-                },
-            }
-        else
-            return {
-                model = model,
-                max_tokens = 1024,
-                system = system_prompt,
-                messages = {
-                    { role = "user", content = prompt },
-                },
-            }
-        end
-    end
 end
 
 function AIAnalyse:retrieveAndShowAISummary(selected_text, book_name, book_authors, with_xray_context)
@@ -372,7 +348,7 @@ function AIAnalyse:getTextUpToCurrentPage()
 
     if self.settings.api_provider == "Gemini" then
         -- gemini offers a much larger context window, so this can be used to get more information
-        max_tail = max_tail * 10
+        max_tail = max_tail * 5
     end
 
     if #text > (max_head + max_tail + 500) then
@@ -386,118 +362,142 @@ function AIAnalyse:getTextUpToCurrentPage()
     return text
 end
 
-function AIAnalyse:stopPlugin()
-    if self.ui.highlight then
-        self.ui.highlight:removeFromHighlightDialog("90_aianalyse_plugin")
-        self.ui.highlight:removeFromHighlightDialog("91_aianalyse_plugin_with_xray")
+function AIAnalyse:getProviderConfig(provider, api_key)
+    if provider == "Gemini" then
+        local model = "gemini-flash-latest"
+        return {
+            model = model,
+            url = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent",
+            headers = {
+                ["content-type"] = "application/json",
+                ["x-goog-api-key"] = api_key,
+            },
+        }
+    else
+        local model = provider == "Anthropic" and "claude-sonnet-4-5" or "deepseek-chat"
+        local url = provider == "Anthropic" and "https://api.anthropic.com/v1/messages"
+            or "https://api.deepseek.com/anthropic/v1/messages"
+        return {
+            model = model,
+            url = url,
+            headers = {
+                ["content-type"] = "application/json",
+                ["x-api-key"] = api_key,
+                ["anthropic-version"] = "2023-06-01",
+                ["anthropic-beta"] = "prompt-caching-2024-07-31",
+            },
+        }
     end
 end
 
-function AIAnalyse:showSettings()
-    local api_key_field = {
-        text = self.settings.api_keys[self.settings.api_provider] or "",
-        hint = _("Enter API Key"),
-        description = _("API Key"),
-    }
-
-    local settings_dialog
-    settings_dialog = MultiInputDialog:new({
-        title = _("AI Analyse Settings"),
-        fields = { api_key_field },
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = function()
-                        UIManager:close(settings_dialog)
-                    end,
+function AIAnalyse:buildProviderPayload(provider, model, prompt, system_prompt, book_content)
+    if provider == "Gemini" then
+        local parts = {}
+        if book_content then
+            table.insert(parts, { text = book_content })
+            table.insert(
+                parts,
+                { text = prompt .. " You should use the text associated from the book provided as context." }
+            )
+            return {
+                contents = { { parts = parts } },
+            }
+        else
+            table.insert(parts, { text = prompt })
+            return {
+                systemInstruction = { parts = { { text = system_prompt } } },
+                contents = { { parts = parts } },
+            }
+        end
+    else
+        if book_content then
+            local prompt_text = prompt .. " You should use the text associated from the book provided as context."
+            return {
+                model = model,
+                max_tokens = 1024,
+                messages = {
+                    {
+                        role = "user",
+                        content = {
+                            { type = "text", text = book_content, cache_control = { type = "ephemeral" } },
+                            { type = "text", text = prompt_text },
+                        },
+                    },
                 },
-                {
-                    text = _("Set AI Provider"),
-                    callback = function()
-                        local fields = settings_dialog:getFields()
-                        self.settings.api_keys[self.settings.api_provider] = fields[1]
-                        self:saveSettings()
-                        UIManager:close(settings_dialog)
-                    end,
+            }
+        else
+            return {
+                model = model,
+                max_tokens = 1024,
+                system = system_prompt,
+                messages = {
+                    { role = "user", content = prompt },
                 },
-            },
-        },
-    })
-
-    local provider_table = RadioButtonTable:new({
-        width = settings_dialog:getAddedWidgetAvailableWidth(),
-        radio_buttons = {
-            {
-                {
-                    text = _("Anthropic"),
-                    checked = (self.settings.api_provider == "Anthropic"),
-                    provider = "Anthropic",
-                },
-            },
-            {
-                {
-                    text = _("DeepSeek"),
-                    checked = (self.settings.api_provider == "DeepSeek"),
-                    provider = "DeepSeek",
-                },
-            },
-            {
-                {
-                    text = _("Gemini"),
-                    checked = (self.settings.api_provider == "Gemini"),
-                    provider = "Gemini",
-                },
-            },
-        },
-        button_select_callback = function(btn_entry)
-            -- 1. Save current input to the OLD provider's slot before switching
-            local current_input = settings_dialog:getFields()[1]
-            self.settings.api_keys[self.settings.api_provider] = current_input
-
-            -- 2. Update active provider
-            self.settings.api_provider = btn_entry.provider
-
-            -- 3. Load NEW provider's key into the input field widget
-            local new_key = self.settings.api_keys[self.settings.api_provider] or ""
-            if settings_dialog.input_fields and settings_dialog.input_fields[1] then
-                -- input filed is the one storing the input box
-                settings_dialog.input_fields[1]:setText(new_key)
-            end
-
-            UIManager:setDirty(settings_dialog, "ui")
-        end,
-    })
-
-    settings_dialog:addWidget(provider_table)
-    UIManager:show(settings_dialog)
-    settings_dialog:onShowKeyboard()
+            }
+        end
+    end
 end
 
-function AIAnalyse:addToMainMenu(menu_items)
-    menu_items.hello_world = {
-        text = _("✨ AI Analyse"),
-        sorting_hint = "more_tools",
-        sub_item_table = {
-            {
-                text = _("Settings"),
-                callback = function()
-                    self:showSettings()
-                end,
-            },
-            {
-                text = _("About"),
-                callback = function()
-                    UIManager:show(InfoMessage:new({
-                        text = _(
-                            "AI Analysis Plugin v1.0\n\nProvides AI-powered explanations for text selections using DeepSeek, Anthropic or Gemini.\n\nSupports recursive lookups and selection highlighting."
-                        ),
-                    }))
-                end,
-            },
-        },
-    }
+function AIAnalyse:handleAIResponse(response_text, code, book_name, book_authors, with_xray_context)
+    if code ~= 200 then
+        UIManager:show(InfoMessage:new({
+            text = "HTTP Error: " .. tostring(code),
+        }))
+        logger.dbg("AIAnalyse: found error response from model: ", tostring(response_text))
+        return
+    end
+
+    local response_json = JSON.decode(response_text)
+    local text_content, cached_tokens = self:extractResponseData(self.settings.api_provider, response_json)
+
+    if text_content then
+        UIManager:show(TextViewerHighlight:new({
+            title = _(self.settings.api_provider .. " Explanation"),
+            text = text_content,
+            width = Device.screen:getWidth() * 0.9,
+            height = Device.screen:getHeight() * 0.9,
+            show_parent = self,
+            highlight_text_selection = true,
+            text_selection_callback = function(selection)
+                self:retrieveAndShowAISummary(selection, book_name, book_authors, with_xray_context)
+            end,
+        }))
+        logger.dbg("AIAnalyse: Cached tokens used: ", cached_tokens)
+    else
+        UIManager:show(InfoMessage:new({
+            text = "Failed to parse response: " .. tostring(response_text),
+        }))
+    end
+end
+
+function AIAnalyse:extractResponseData(provider, response_json)
+    local text_content, cached_tokens = nil, 0
+    if not response_json then
+        return text_content, cached_tokens
+    end
+
+    if provider == "Gemini" then
+        if
+            response_json.candidates
+            and response_json.candidates[1]
+            and response_json.candidates[1].content
+            and response_json.candidates[1].content.parts
+            and response_json.candidates[1].content.parts[1]
+        then
+            text_content = response_json.candidates[1].content.parts[1].text
+            if response_json.usageMetadata and response_json.usageMetadata.cachedContentTokenCount then
+                cached_tokens = response_json.usageMetadata.cachedContentTokenCount
+            end
+        end
+    else
+        if response_json.content and response_json.content[1] and response_json.content[1].text then
+            text_content = response_json.content[1].text
+            if response_json.usage and response_json.usage.cache_read_input_tokens then
+                cached_tokens = response_json.usage.cache_read_input_tokens
+            end
+        end
+    end
+    return text_content, cached_tokens
 end
 
 return AIAnalyse
