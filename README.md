@@ -4,7 +4,7 @@
 
 Supports XRay analysis on a book.
 
-![text analysis](https://dump-show-cap.s3.ap-southeast-2.amazonaws.com/aianalyse.gif)
+![text analysis](https://dump-show-cap.s3.ap-southeast-2.amazonaws.com/aianalyse-01.gif)
 
 ## Supported LLM Providers
 
